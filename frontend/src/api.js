@@ -1,4 +1,4 @@
-export const DEFAULT_API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+export const DEFAULT_API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://ai-news-aggregator-backend-nine.vercel.app';
 const API_URL_STORAGE_KEY = 'signal.apiBaseUrl';
 
 export function getApiBaseUrl() {
