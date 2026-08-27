@@ -22,12 +22,11 @@ class Article(BaseModel):
     language: str | None = None
     quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
     ai_relevance_score: float = Field(default=0.0, ge=0.0, le=1.0)
-    technology_relevance_score: float = Field(default=0.0, ge=0.0, le=1.0)
-    indian_politics_relevance_score: float = Field(default=0.0, ge=0.0, le=1.0)
     importance_score: float = Field(default=0.0, ge=0.0, le=10.0)
     why_it_matters: str | None = None
     ai_processed: bool = False
     ai_processed_at: datetime | None = None
+    ai_provider: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     title_source_key: str = ""

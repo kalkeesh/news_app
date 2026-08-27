@@ -1,5 +1,5 @@
 """Vercel Python entry point for the FastAPI application."""
 
-from app.main import app
+from app.service_a import app
 
 __all__ = ["app"]

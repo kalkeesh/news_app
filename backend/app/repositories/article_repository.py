@@ -123,7 +123,5 @@ class ArticleRepository:
         return {
             "total": await self.collection.count_documents({}),
             "ai": grouped.get("AI", 0),
-            "technology": grouped.get("Technology", 0),
-            "indian_politics": grouped.get("Indian Politics", 0),
             "latest_update": latest.get("updated_at") if latest else None,
         }

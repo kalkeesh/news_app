@@ -2,18 +2,20 @@
 
 import html
 import logging
+import json
+import os
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 import httpx
 
 from app.models.article import Article
 from app.repositories.article_repository import ArticleRepository
+from app.services.ai.ai_service import AIBatchError, classify_ambiguous_batch
 from app.services.news_collector import collect_all_news
-from app.services.gemini_service import GeminiClassificationError, classify_article
 
 
 TAG_RE = re.compile(r"<[^>]*>")
@@ -21,19 +23,19 @@ SPACE_RE = re.compile(r"\s+")
 SPAM_TERMS = ("login", "sign in", "subscribe", "privacy policy", "terms of use")
 logger = logging.getLogger(__name__)
 
-AI_TERMS = {
-    "artificial intelligence", "generative ai", "machine learning", "llm", "large language model",
-    "openai", "chatgpt", "gemini", "anthropic", "claude", "nvidia ai", "ai agent", "ai model",
-    "ai research", "ai regulation", "ai safety", "deep learning", "neural network",
+AI_CONFIDENT_TERMS = {
+    "artificial intelligence", "generative ai",
+    "large language model", "llm", "ai model", "ai agent", "ai research", "ai safety",
+    "computer vision", "natural language processing",
+    "openai", "anthropic", "chatgpt", "claude", "gemini", "hugging face",
 }
-TECH_TERMS = {
-    "software", "programming", "developer", "cloud", "cybersecurity", "cyber security", "semiconductor",
-    "chip", "hardware", "smartphone", "database", "developer tools", "enterprise technology", "it industry",
-    "tech company", "startup", "coding", "data center", "operating system", "job", "computing",
+AI_SIGNAL_TERMS = {
+    "ai", "inference", "foundation model", "transformer", "fine-tuning", "fine tuning",
+    "gpu", "nvidia", "accelerator", "autonomous", "generative", "model training",
+    "ai regulation", "ai policy", "ai startup", "ai chip", "ai hardware",
 }
-INDIA_TERMS = {"india", "indian", "new delhi", "lok sabha", "rajya sabha", "modi", "bjp", "congress party"}
-POLITICS_TERMS = {"politics", "political", "election", "minister", "government", "parliament", "president", "senate", "congress"}
-GENERAL_IRRELEVANT_TERMS = {"celebrity", "recipe", "football", "cricket", "movie", "horoscope", "weather", "travel"}
+AI_MAX_BATCH_ARTICLES_DEFAULT = 50
+AI_MAX_PROMPT_CHARS_DEFAULT = 30000
 
 
 def clean_text(value: Any) -> str | None:
@@ -101,34 +103,28 @@ def quality_score(title: str, summary: str | None, url: str) -> float:
 
 def classify_locally(article: Article) -> tuple[str, dict[str, Any]]:
     text = " ".join(filter(None, [article.title, article.source, article.summary, article.category])).casefold()
-    ai_hits = sum(term in text for term in AI_TERMS)
-    tech_hits = sum(term in text for term in TECH_TERMS)
-    india_hits = sum(term in text for term in INDIA_TERMS)
-    politics_hits = sum(term in text for term in POLITICS_TERMS)
-    irrelevant_hits = sum(term in text for term in GENERAL_IRRELEVANT_TERMS)
-    if irrelevant_hits and not ai_hits and not tech_hits:
-        return "reject", {}
-    if politics_hits and not india_hits and not (ai_hits or tech_hits):
-        return "reject", {}
-    if ai_hits or tech_hits or (politics_hits and india_hits):
-        category = "AI" if ai_hits else "Indian Politics" if politics_hits and india_hits else "Technology"
-        subcategory = "AI" if ai_hits else "Indian Politics" if politics_hits and india_hits else "Technology"
-        score = min(1.0, 0.55 + 0.1 * max(ai_hits, tech_hits, india_hits))
+    confident_hits = sum(term in text for term in AI_CONFIDENT_TERMS)
+    signal_hits = sum(term in text for term in AI_SIGNAL_TERMS)
+    if confident_hits:
         return "keep", {
-            "category": category,
-            "subcategory": subcategory,
+            "category": "AI",
+            "subcategory": "AI",
             "topics": [],
-            "ai_relevance_score": min(1.0, ai_hits * 0.25) if ai_hits else 0.0,
-            "technology_relevance_score": min(1.0, tech_hits * 0.2) if tech_hits else 0.0,
-            "indian_politics_relevance_score": min(1.0, india_hits * 0.25) if politics_hits else 0.0,
-            "importance_score": min(10.0, 4.0 + max(ai_hits, tech_hits, india_hits)),
+            "ai_relevance_score": min(1.0, 0.6 + confident_hits * 0.1),
+            "importance_score": min(10.0, 4.0 + confident_hits),
             "why_it_matters": None,
             "summary": article.summary,
             "ai_processed": False,
         }
-    if not text or len(text) < 20:
-        return "reject", {}
-    return "ambiguous", {}
+    if signal_hits:
+        return "ambiguous", {}
+    return "reject", {}
+
+
+def _ai_signal_score(article: Article) -> tuple[int, float, str]:
+    text = " ".join(filter(None, [article.title, article.source, article.summary])).casefold()
+    hits = sum(term in text for term in AI_SIGNAL_TERMS)
+    return hits, article.quality_score, article.title_source_key
 
 
 def normalize_article(raw: Any) -> Article | None:
@@ -165,8 +161,16 @@ def normalize_article(raw: Any) -> Article | None:
     )
 
 
-async def ingest_articles(repository: ArticleRepository) -> dict[str, int]:
-    raw_articles = await collect_all_news()
+async def ingest_articles(
+    repository: ArticleRepository,
+    collector: Callable[[], Awaitable[list[dict[str, Any]]]] = collect_all_news,
+) -> dict[str, Any]:
+    raw_articles = await collector()
+    fetched_by_source: dict[str, int] = {}
+    for raw_article in raw_articles:
+        if isinstance(raw_article, dict):
+            source_type = raw_article.get("source_type") or "unknown"
+            fetched_by_source[source_type] = fetched_by_source.get(source_type, 0) + 1
     resolved_articles = []
     for raw_article in raw_articles:
         if isinstance(raw_article, dict) and usable_url(raw_article.get("url")):
@@ -193,26 +197,87 @@ async def ingest_articles(repository: ArticleRepository) -> dict[str, int]:
         seen_title_source_keys.add(article.title_source_key)
         normalized.append(article)
 
+    total_normalized = len(normalized)
+    existing_urls, existing_keys = await repository.existing_keys(normalized)
+    existing_normalized_count = sum(
+        article.url in existing_urls or article.title_source_key in existing_keys
+        for article in normalized
+    )
+    normalized = [
+        article for article in normalized
+        if article.url not in existing_urls
+        and article.title_source_key not in existing_keys
+    ]
+
     candidates: list[Article] = []
     rejected_by_relevance = 0
-    gemini_processed = 0
+    ambiguous_articles: list[Article] = []
     for article in normalized:
         decision, enrichment = classify_locally(article)
         if decision == "reject":
             rejected_by_relevance += 1
             continue
         if decision == "ambiguous":
-            try:
-                enrichment = await classify_article(article.title, article.source, article.summary)
-                gemini_processed += 1
-            except GeminiClassificationError as error:
-                logger.warning("Skipping ambiguous article after Gemini failure: %s", error)
-                continue
-            if not enrichment["keep"]:
-                rejected_by_relevance += 1
-                continue
+            ambiguous_articles.append(article)
+            continue
         now = datetime.now(timezone.utc)
-        candidates.append(article.model_copy(update={**enrichment, "ai_processed": decision == "ambiguous", "ai_processed_at": now if decision == "ambiguous" else None, "updated_at": now}))
+        candidates.append(article.model_copy(update={**enrichment, "ai_processed": False, "ai_processed_at": None, "ai_provider": None, "updated_at": now}))
+
+    ai_stats = {"gemini_batches": 0, "groq_batches": 0, "openrouter_batches": 0, "ai_failures": 0}
+    ai_articles_processed = 0
+    provider_articles_processed = {"gemini": 0, "groq": 0, "openrouter": 0}
+    ai_articles_skipped_by_limit = 0
+    if ambiguous_articles:
+        max_articles = max(1, int(os.getenv("AI_MAX_BATCH_ARTICLES", str(AI_MAX_BATCH_ARTICLES_DEFAULT))))
+        configured_prompt_chars = max(1000, int(os.getenv("AI_MAX_PROMPT_CHARS", str(AI_MAX_PROMPT_CHARS_DEFAULT))))
+        # Leave room for the provider instruction wrapper around the records.
+        max_prompt_chars = max(500, configured_prompt_chars - 2000)
+        ranked = sorted(ambiguous_articles, key=lambda article: (-_ai_signal_score(article)[0], -_ai_signal_score(article)[1], _ai_signal_score(article)[2]))
+        selected_articles: list[Article] = []
+        prompt_chars = 2
+        for article in ranked:
+            if len(selected_articles) >= max_articles:
+                break
+            record_size = len(json.dumps({"id": article.title_source_key, "title": article.title, "source": article.source, "summary": article.summary or ""}, ensure_ascii=True, separators=(",", ":")))
+            if selected_articles and prompt_chars + record_size + 1 > max_prompt_chars:
+                continue
+            if not selected_articles and prompt_chars + record_size > max_prompt_chars:
+                continue
+            selected_articles.append(article)
+            prompt_chars += record_size + 1
+        ai_articles_skipped_by_limit = len(ambiguous_articles) - len(selected_articles)
+        ambiguous_articles = selected_articles
+        records = [
+            {
+                "id": article.title_source_key,
+                "title": article.title,
+                "source": article.source,
+                "summary": article.summary or "",
+            }
+            for article in ambiguous_articles
+        ]
+        try:
+            classifications, ai_stats = await classify_ambiguous_batch(records)
+        except AIBatchError as error:
+            ai_stats = error.stats
+            logger.warning("Skipping ambiguous batch after all AI providers failed: %s", error)
+        else:
+            now = datetime.now(timezone.utc)
+            ai_articles_processed = len(classifications)
+            selected_provider = next(iter(classifications.values()), {}).get("ai_provider")
+            if selected_provider:
+                provider_articles_processed[selected_provider] = len(classifications)
+            for article in ambiguous_articles:
+                classification = classifications[article.title_source_key]
+                if not classification["keep"]:
+                    rejected_by_relevance += 1
+                    continue
+                candidates.append(article.model_copy(update={
+                    **{key: value for key, value in classification.items() if key not in {"id", "keep"}},
+                    "ai_processed": True,
+                    "ai_processed_at": now,
+                    "updated_at": now,
+                }))
 
     existing_urls, existing_keys = await repository.existing_keys(candidates)
     new_articles = [
@@ -220,15 +285,22 @@ async def ingest_articles(repository: ArticleRepository) -> dict[str, int]:
         if article.url not in existing_urls
         and article.title_source_key not in existing_keys
     ]
-    already_existing = len(candidates) - len(new_articles)
+    already_existing = existing_normalized_count + len(candidates) - len(new_articles)
     inserted = await repository.insert_new(new_articles)
     return {
         "total_fetched": len(raw_articles),
-        "total_normalized": len(normalized),
+        "total_normalized": total_normalized,
         "duplicates_removed": duplicates_removed,
         "rejected": rejected,
         "rejected_by_relevance": rejected_by_relevance,
-        "gemini_processed": gemini_processed,
+        "gemini_processed": provider_articles_processed["gemini"],
         "inserted": inserted,
         "already_existing": already_existing + len(new_articles) - inserted,
+        "fetched_by_source": fetched_by_source,
+        "gemini_batches": ai_stats["gemini_batches"],
+        "groq_batches": ai_stats["groq_batches"],
+        "openrouter_batches": ai_stats["openrouter_batches"],
+        "ai_articles_processed": ai_articles_processed,
+        "ai_articles_skipped_by_limit": ai_articles_skipped_by_limit,
+        "ai_failures": ai_stats["ai_failures"],
     }
